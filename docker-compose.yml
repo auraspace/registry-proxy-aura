@@ -1,0 +1,17 @@
+services:
+  registry-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: registry-proxy-aura:local
+    restart: unless-stopped
+    ports:
+      - "${AURA_PROXY_PORT:-8080}:8080"
+    environment:
+      AURA_REGISTRY_ROOT: /data/registry
+      AURA_REGISTRY_UPSTREAM: "${AURA_REGISTRY_UPSTREAM:-}"
+    volumes:
+      - registry-cache:/data/registry
+
+volumes:
+  registry-cache:
