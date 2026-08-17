@@ -1,0 +1,5 @@
+# aura.lock — path dependencies and immutable Git pins
+# Direct deps match aura.toml; extra path entries are transitive.
+# Git pins: name = { version = "…", checksum = "…", source = "git+…", rev = "…" }
+# Macro pins: macro_plugin.Name = { path = "…", checksum = "…", source = "plugin" }
+pulse = { version = "1.0.0", checksum = "sha256:cf63f71d6142bb5e6133617c6fb0aabeed6080488983a8ad8bb9a16256043169", source = "git+https://github.com/auraspace/pulse", rev = "635f07524646756334ab73ee1c5e781a2cd5b87e" }

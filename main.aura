@@ -1,0 +1,226 @@
+// Temporary RFC-005 registry proxy.
+//
+// The proxy is intentionally origin-preserving: it only serves objects under
+// /<owner>/<repo>/@v/<object>. It never publishes or rewrites a package.
+package registry_proxy_aura
+
+import pulse as Pulse
+import std.bytes as BinaryBuffer
+import std.fs as Fs
+import std.http as Http
+import std.io as Io
+import std.os as Os
+
+const DEFAULT_ROOT: String = "registry"
+const DEFAULT_UPSTREAM: String = ""
+const MAX_OBJECT_BYTES: Int = 67108864
+
+fun envOr(name: String, fallback: String): String {
+    val value = Os.getEnv(name)
+    if (value == null || value!!.trim().isEmpty()) {
+        return fallback
+    }
+    return value!!
+}
+
+fun join3(a: String, b: String, c: String): String {
+    return Fs.join(Fs.join(a, b), c)
+}
+
+fun validSegment(value: String): Bool {
+    if (value.isEmpty() || value == "." || value == "..") {
+        return false
+    }
+    if (value.indexOf("/") >= 0 || value.indexOf("\\") >= 0) {
+        return false
+    }
+    return true
+}
+
+fun validObject(value: String): Bool {
+    if (!validSegment(value)) {
+        return false
+    }
+    if (value == "list") {
+        return true
+    }
+    if (value.endsWith(".info") || value.endsWith(".mod") || value.endsWith(".zip")) {
+        return true
+    }
+    return false
+}
+
+fun statusFrom(raw: String): Int {
+    if (!raw.startsWith("HTTP/1.") || raw.len < 12) {
+        return 0
+    }
+    val status = raw.substring(9, 12).toInt()
+    if (status == null) {
+        return 0
+    }
+    return status!!
+}
+
+fun responseBody(raw: String): String {
+    val marker = raw.indexOf("\r\n\r\n")
+    if (marker < 0) {
+        return ""
+    }
+    return raw.substring(marker + 4, raw.len)
+}
+
+fun cachePath(root: String, owner: String, repo: String, objectName: String): String {
+    return Fs.join(join3(root, owner, repo), Fs.join("@v", objectName))
+}
+
+fun cacheParent(root: String, owner: String, repo: String): String {
+    return Fs.join(join3(root, owner, repo), "@v")
+}
+
+fun ensureCacheParent(root: String, owner: String, repo: String): Unit {
+    if (!Fs.ensureDirectory(cacheParent(root, owner, repo))) {
+        return
+    }
+}
+
+fun readLocal(path: String): String? {
+    return Io.tryReadFile(path)
+}
+
+fun writeCache(path: String, body: String): Bool {
+    return Io.tryWriteFileAtomic(path, body)
+}
+
+async fun fetchUpstream(upstream: String, target: String): String? {
+    if (upstream.isEmpty()) {
+        return null
+    }
+    try {
+        val bytes = await Http.getBytes(upstream, target)
+        return BinaryBuffer.bufferToString(bytes)
+    } catch (error: String) {
+        return null
+    }
+}
+
+async fun objectBody(root: String, upstream: String, owner: String,
+              repo: String, objectName: String): String? {
+    val path = cachePath(root, owner, repo, objectName)
+    val cached = readLocal(path)
+    if (cached != null) {
+        return cached
+    }
+
+    val target = "/" + owner + "/" + repo + "/@v/" + objectName
+    val fetched = await fetchUpstream(upstream, target)
+    if (fetched == null || fetched!!.len > MAX_OBJECT_BYTES ||
+            (fetched!!.isEmpty() && objectName != "list")) {
+        return null
+    }
+    ensureCacheParent(root, owner, repo)
+    if (!writeCache(path, fetched!!)) {
+        // Serving a fetched object is still safe when a read-only cache is
+        // configured; the next request will fetch it again.
+        return fetched!!
+    }
+    return fetched!!
+}
+
+async fun health(ctx: Pulse.Context): Unit {
+    ctx.ok("ok\n")
+}
+
+async fun objectHandler(ctx: Pulse.Context): Unit {
+    if (ctx.method() != "GET" && ctx.method() != "HEAD") {
+        ctx.send(405, "method not allowed\n")
+        return
+    }
+
+    val owner = ctx.param("owner")
+    val repo = ctx.param("repo")
+    val objectName = ctx.param("object")
+    if (!validSegment(owner) || !validSegment(repo) || !validObject(objectName)) {
+        ctx.send(400, "invalid registry object\n")
+        return
+    }
+
+    val root = envOr("AURA_REGISTRY_ROOT", DEFAULT_ROOT)
+    val upstream = envOr("AURA_REGISTRY_UPSTREAM", DEFAULT_UPSTREAM)
+    val target = "/" + owner + "/" + repo + "/@v/" + objectName
+    if (objectName.endsWith(".zip")) {
+        ctx.header("Content-Type", "application/zip")
+        ctx.header("X-Aura-Origin", "https://github.com/" + owner + "/" + repo)
+        ctx.header("X-Aura-Object", target)
+        val archivePath = cachePath(root, owner, repo, objectName)
+        if (ctx.method() == "HEAD" && Io.fileExists(archivePath)) {
+            ctx.status(200)
+            return
+        }
+        if (!Io.fileExists(archivePath)) {
+            if (upstream.isEmpty()) {
+                ctx.notFound("registry object not found\n")
+                return
+            }
+            try {
+                val fetchedArchive = await Http.getBytes(upstream, target)
+                ensureCacheParent(root, owner, repo)
+                if (!BinaryBuffer.tryWriteFileBytesAtomic(archivePath, fetchedArchive)) {
+                    // A read-only cache must not prevent serving a valid fetch.
+                }
+                if (ctx.method() == "HEAD") {
+                    ctx.status(200)
+                    return
+                }
+                ctx.status(200)
+                ctx.response.setBodyBytes(fetchedArchive)
+                return
+            } catch (error: String) {
+                ctx.send(502, "upstream archive unavailable: " + error + "\n")
+                return
+            }
+        }
+        val archive = BinaryBuffer.readFileBytes(archivePath)
+        ctx.status(200)
+        ctx.response.setBodyBytes(archive)
+        return
+    }
+
+    if (objectName.endsWith(".info")) {
+        ctx.header("Content-Type", "application/json")
+    } else {
+        ctx.header("Content-Type", "text/plain; charset=utf-8")
+    }
+    ctx.header("X-Aura-Origin", "https://github.com/" + owner + "/" + repo)
+    ctx.header("X-Aura-Object", target)
+    val body = await objectBody(root, upstream, owner, repo, objectName)
+    if (body == null) {
+        ctx.notFound("registry object not found\n")
+        return
+    }
+    if (ctx.method() == "HEAD") {
+        ctx.status(200)
+        return
+    }
+    ctx.status(200).send(body!!)
+}
+
+async fun errors(error: String, ctx: Pulse.Context): Unit {
+    ctx.send(500, "registry proxy error: " + error + "\n")
+}
+
+fun main() {
+    val values = Io.args()
+    var port = 8080
+    if (values.len > 1 && values.get(1).toInt() != null) {
+        port = values.get(1).toInt()!!
+    }
+
+    val app = Pulse.webApp(MAX_OBJECT_BYTES)
+    app.get("/healthz", (ctx: Pulse.Context) => health(ctx))
+    app.all("/:owner/:repo/@v/:object", (ctx: Pulse.Context) => objectHandler(ctx))
+
+    println("registry proxy listening on http://127.0.0.1:" + port.toString())
+    println("cache root: " + envOr("AURA_REGISTRY_ROOT", DEFAULT_ROOT))
+    println("upstream: " + envOr("AURA_REGISTRY_UPSTREAM", "<disabled>"))
+    app.listen(port)
+}

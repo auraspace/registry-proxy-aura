@@ -1,0 +1,10 @@
+[package]
+name = "registry_proxy_aura"
+version = "0.1.0"
+
+[[bin]]
+name = "registry-proxy-aura"
+path = "main.aura"
+
+[dependencies]
+pulse = { github = "auraspace/pulse", tag = "v1.0.0" }
