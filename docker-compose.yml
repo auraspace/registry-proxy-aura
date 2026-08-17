@@ -1,9 +1,7 @@
 services:
   registry-proxy:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: registry-proxy-aura:local
+    image: "${REGISTRY_IMAGE:-ghcr.io/auraspace/registry-proxy-aura:latest}"
+    pull_policy: always
     restart: unless-stopped
     ports:
       - "${AURA_PROXY_PORT:-8080}:8080"
